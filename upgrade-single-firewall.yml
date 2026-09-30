@@ -1,0 +1,95 @@
+---
+- hosts: '{{ target | default("firewall") }}'
+  connection: local
+  vars:
+    device:
+      ip_address: "{{ ip_address }}"
+      username: "{{ username | default(omit) }}"
+      password: "{{ password | default(omit) }}"
+      api_key: "{{ api_key | default(omit) }}"
+  collections:
+    - paloaltonetworks.panos
+
+  tasks:
+
+    # ---------- 1. PRE-UPGRADE VERSION + UPTIME CHECK ----------
+    - name: Get system info before upgrade
+      paloaltonetworks.panos.panos_op:
+        provider: "{{ device }}"
+        cmd: "show system info"
+      register: pre_info
+
+    - name: Parse pre-upgrade facts
+      set_fact:
+        sw_version_before: "{{ pre_info.stdout | regex_search('<sw-version>(.*?)</sw-version>', '\\1') | first }}"
+        app_version_before: "{{ pre_info.stdout | regex_search('<app-version>(.*?)</app-version>', '\\1') | first }}"
+        threat_version_before: "{{ pre_info.stdout | regex_search('<threat-version>(.*?)</threat-version>', '\\1') | first }}"
+        av_version_before: "{{ pre_info.stdout | regex_search('<av-version>(.*?)</av-version>', '\\1') | first }}"
+        uptime_before: "{{ pre_info.stdout | regex_search('<uptime>(.*?)</uptime>', '\\1') | first }}"
+
+    - name: Display current versions and uptime
+      debug:
+        msg:
+          - "Current PAN-OS version : {{ sw_version_before }}"
+          - "Current App version    : {{ app_version_before }}"
+          - "Current Threat version : {{ threat_version_before }}"
+          - "Current AV version     : {{ av_version_before }}"
+          - "Current uptime         : {{ uptime_before }}"
+
+    # ---------- 2. BACKUP + CONTENT UPDATE ----------
+    - name: Save a backup of the running config
+      paloaltonetworks.panos.panos_op:
+        provider: "{{ device }}"
+        cmd: "save config to pre-upgrade-backup.xml"
+
+    - name: Check current content version and update if needed
+      paloaltonetworks.panos.panos_content_update:
+        provider: "{{ device }}"
+        state: latest
+        sync_to_peer: false
+
+    # ---------- 3. INSTALL TARGET PAN-OS + REBOOT ----------
+    - name: Download and install target PAN-OS version, then reboot
+      paloaltonetworks.panos.panos_software:
+        provider: "{{ device }}"
+        version: "10.2.3"
+        download: true
+        install: true
+        restart: true
+
+    - name: Pause to let the firewall start rebooting
+      pause:
+        seconds: 60
+
+    - name: Wait until the firewall is back up and ready
+      paloaltonetworks.panos.panos_check:
+        provider: "{{ device }}"
+      changed_when: false
+      register: result
+      until: result is not failed and result.msg == 'Device is ready.'
+      retries: 100
+      delay: 15
+
+    # ---------- 4. POST-UPGRADE VERSION + UPTIME CHECK ----------
+    - name: Get system info after upgrade
+      paloaltonetworks.panos.panos_op:
+        provider: "{{ device }}"
+        cmd: "show system info"
+      register: post_info
+
+    - name: Parse post-upgrade facts
+      set_fact:
+        sw_version_after: "{{ post_info.stdout | regex_search('<sw-version>(.*?)</sw-version>', '\\1') | first }}"
+        uptime_after: "{{ post_info.stdout | regex_search('<uptime>(.*?)</uptime>', '\\1') | first }}"
+
+    - name: Display post-upgrade versions and uptime
+      debug:
+        msg:
+          - "New PAN-OS version : {{ sw_version_after }}"
+          - "New uptime         : {{ uptime_after }}"
+          - "Reboot confirmed   : {{ (uptime_after != uptime_before) | ternary('YES - device rebooted', 'WARNING - uptime unchanged, reboot may not have occurred') }}"
+
+    - name: Fail the play if the version did not actually change
+      fail:
+        msg: "Upgrade did not take effect — sw-version is still {{ sw_version_after }}"
+      when: sw_version_after != "10.2.3"
